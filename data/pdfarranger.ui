@@ -99,6 +99,27 @@ along with PDF Arranger.  If not, see <http://www.gnu.org/licenses/>.
                 <property name="position">2</property>
               </packing>
             </child>
+            <child>
+              <object class="GtkButton" id="compress_bar_button">
+                <property name="visible">True</property>
+                <property name="can_focus">False</property>
+                <property name="receives_default">False</property>
+                <property name="tooltip_text" translatable="yes">Compress</property>
+                <property name="action_name">win.compress</property>
+                <child>
+                  <object class="GtkImage">
+                    <property name="visible">True</property>
+                    <property name="can_focus">False</property>
+                    <property name="icon_name">go-bottom-symbolic</property>
+                  </object>
+                </child>
+              </object>
+              <packing>
+                <property name="expand">False</property>
+                <property name="fill">True</property>
+                <property name="position">2</property>
+              </packing>
+            </child>
             <style>
               <class name="linked"/>
             </style>
@@ -295,6 +316,19 @@ along with PDF Arranger.  If not, see <http://www.gnu.org/licenses/>.
         </child>
         <child>
           <object class="GtkProgressBar" id="progressbar">
+            <property name="height_request">20</property>
+            <property name="visible">True</property>
+            <property name="can_focus">False</property>
+          </object>
+          <packing>
+            <property name="expand">False</property>
+            <property name="fill">True</property>
+            <property name="padding">5</property>
+            <property name="position">3</property>
+          </packing>
+        </child>
+        <child>
+          <object class="GtkSpinner" id="spinner">
             <property name="height_request">20</property>
             <property name="visible">True</property>
             <property name="can_focus">False</property>

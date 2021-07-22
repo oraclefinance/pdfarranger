@@ -20,6 +20,7 @@ import sys  # for processing of command line args
 import tempfile
 import signal
 import mimetypes
+import threading
 import warnings
 import traceback
 import locale  # for multilanguage support
@@ -27,10 +28,10 @@ import gettext
 import gc
 import subprocess
 import ctypes
+
 import pikepdf
 from urllib.request import url2pathname
 from functools import lru_cache
-
 
 sharedir = os.path.join(sys.prefix, 'share')
 basedir = '.'
@@ -76,6 +77,7 @@ WEBSITE = 'https://github.com/pdfarranger/pdfarranger'
 if os.name == 'nt':
     # Add support for dnd to other instance and insert file at drop location in Windows
     import keyboard  # to get control key state when drag to other instance
+
     os.environ['GDK_WIN32_USE_EXPERIMENTAL_OLE2_DND'] = 'true'
     # Use client side decorations. Will also enable window moving with Win + left/right
     os.environ['GTK_CSD'] = '1'
@@ -112,11 +114,13 @@ from . import exporter
 from . import metadata
 from . import croputils
 from . import splitter
+from . import compress
 from .iconview import CellRendererImage
 from .iconview import IconviewCursor
 from .iconview import IconviewDragSelect
 from .config import Config
 from .core import img2pdf_supported_img, PageAdder, PDFDocError, PDFRenderer
+
 GObject.type_register(CellRendererImage)
 
 
@@ -182,8 +186,10 @@ def malloc_trim_available():
     except (FileNotFoundError, AttributeError, OSError):
         print('malloc_trim not available. Application may not release memory properly.')
         return
+
     def mtrim():
         ctypes.CDLL('libc.so.6').malloc_trim(0)
+
     return mtrim
 
 
@@ -196,6 +202,20 @@ def get_file_path_from_uri(uri):
         path = '/' + path
     return path
 
+class DialogExample(Gtk.Dialog):
+    def __init__(self, parent):
+        super().__init__(title="My Dialog", transient_for=parent, flags=0)
+        self.add_buttons(
+            Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OK, Gtk.ResponseType.OK
+        )
+
+        self.set_default_size(150, 100)
+
+        label = Gtk.Label(label="This is a dialog to display additional information")
+
+        box = self.get_content_area()
+        box.add(label)
+        self.show_all()
 
 class PdfArranger(Gtk.Application):
     # Drag and drop ID for pages coming from the same pdfarranger instance
@@ -215,7 +235,7 @@ class PdfArranger(Gtk.Application):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, application_id="com.github.jeromerobert.pdfarranger",
                          flags=Gio.ApplicationFlags.NON_UNIQUE |
-                            Gio.ApplicationFlags.HANDLES_COMMAND_LINE,
+                               Gio.ApplicationFlags.HANDLES_COMMAND_LINE,
                          **kwargs)
 
         # Create the temporary directory
@@ -272,10 +292,10 @@ class PdfArranger(Gtk.Application):
 
     def add_arguments(self):
         self.set_option_context_summary(_(
-           "PDF Arranger is a small python-gtk application, which helps the "
-           "user to merge or split pdf documents and rotate, crop and rearrange "
-           "their pages using an interactive and intuitive graphical interface. "
-           "It is a frontend for pikepdf."
+            "PDF Arranger is a small python-gtk application, which helps the "
+            "user to merge or split pdf documents and rotate, crop and rearrange "
+            "their pages using an interactive and intuitive graphical interface. "
+            "It is a frontend for pikepdf."
         ))
 
         self.add_main_option(
@@ -344,6 +364,7 @@ class PdfArranger(Gtk.Application):
             ('redo', self.undomanager.redo),
             ('split', self.split_pages),
             ('metadata', self.edit_metadata),
+            ('compress', self.on_action_compress),
             ('cut', self.on_action_cut),
             ('copy', self.on_action_copy),
             ('paste', self.on_action_paste, 'i'),
@@ -366,7 +387,7 @@ class PdfArranger(Gtk.Application):
                                      self.window.lookup_action('redo'))
 
     def insert_blank_page(self, _action, _option, _unknown):
-        size = (21 / 2.54 * 72, 29.7 / 2.54 * 72) # A4 by default
+        size = (21 / 2.54 * 72, 29.7 / 2.54 * 72)  # A4 by default
         selection = self.iconview.get_selected_items()
         selection.sort()
         model = self.iconview.get_model()
@@ -487,7 +508,7 @@ class PdfArranger(Gtk.Application):
         self.iconview.connect('motion_notify_event', self.iv_motion)
         self.iconview.connect('button_release_event', self.iv_button_release_event)
         self.id_selection_changed_event = self.iconview.connect('selection_changed',
-                                                          self.iv_selection_changed_event)
+                                                                self.iv_selection_changed_event)
         self.iconview.connect('key_press_event', self.iv_key_press_event)
 
         self.sw.add_with_viewport(self.iconview)
@@ -498,6 +519,9 @@ class PdfArranger(Gtk.Application):
 
         # Progress bar
         self.progress_bar = self.uiXML.get_object('progressbar')
+
+        # Spinner
+        self.spinner = self.uiXML.get_object('spinner')
 
         # Status bar.
         self.status_bar = self.uiXML.get_object('statusbar')
@@ -567,7 +591,7 @@ class PdfArranger(Gtk.Application):
 
         if options.lookup_value(GLib.OPTION_REMAINING):
             files = [Gio.File.new_for_commandline_arg(i)
-                    for i in options.lookup_value(GLib.OPTION_REMAINING)]
+                     for i in options.lookup_value(GLib.OPTION_REMAINING)]
 
             a = PageAdder(self)
             for f in files:
@@ -594,7 +618,7 @@ class PdfArranger(Gtk.Application):
         self.visible_range = self.get_visible_range2()
         columns_nr = self.iconview.get_columns()
         self.rendering_thread = PDFRenderer(self.model, self.pdfqueue,
-                                            self.visible_range , columns_nr)
+                                            self.visible_range, columns_nr)
         self.rendering_thread.connect('update_thumbnail', self.update_thumbnail)
         self.rendering_thread.start()
 
@@ -704,7 +728,7 @@ class PdfArranger(Gtk.Application):
             # Page no longer exist
             return
         if (self.visible_range[0] <= path.get_indices()[0] <= self.visible_range[1] and
-            resample != 1 / self.zoom_scale):
+                resample != 1 / self.zoom_scale):
             # Thumbnail is in the visible range but is not rendered for current zoom level
             self.silent_render()
             return
@@ -779,7 +803,7 @@ class PdfArranger(Gtk.Application):
             iw_width = self.sw.get_allocation().width
             # 2 * min_margin + col_num * padded_cell_width
             #  + min_col_spacing * (col_num+1) = iw_width
-            col_num = (iw_width - 2 * min_margin - min_col_spacing) //\
+            col_num = (iw_width - 2 * min_margin - min_col_spacing) // \
                       (padded_cell_width + min_col_spacing)
             spacing = (iw_width - col_num * padded_cell_width - 2 * min_margin) // (col_num + 1)
             margin = (iw_width - col_num * (padded_cell_width + spacing) + spacing) // 2
@@ -916,7 +940,7 @@ class PdfArranger(Gtk.Application):
         else:
             display = Gdk.Display.get_default()
             launch_context = display.get_app_launch_context()
-            desktop_file = "%s.desktop"%(self.get_application_id())
+            desktop_file = "%s.desktop" % (self.get_application_id())
             try:
                 app_info = Gio.DesktopAppInfo.new(desktop_file)
                 app_info.launch([], launch_context)
@@ -929,7 +953,7 @@ class PdfArranger(Gtk.Application):
     def save_or_choose(self):
         """Saves to the previously exported file or shows the export dialog if
         there was none."""
-        savemode = GLib.Variant('i', 0) # Save all pages in a single document.
+        savemode = GLib.Variant('i', 0)  # Save all pages in a single document.
         try:
             if self.export_file:
                 self.save(savemode, self.export_file)
@@ -940,6 +964,51 @@ class PdfArranger(Gtk.Application):
 
     def on_action_save_as(self, _action, _param, _unknown):
         self.choose_export_pdf_name(GLib.Variant('i', 0))
+
+    def init_compress(self, func, args):
+        self.spinner.start()
+        self.worker = threading.Thread(target=func, args=[args])
+        self.worker.start()
+
+    def stop_compress(self):
+        self.worker.join()
+        self.spinner.stop()
+        if self.compressed_success:
+            self.error_message_dialog(self.compressed_success ,msg_type=Gtk.MessageType.INFO)
+        else:
+            self.error_message_dialog("Can only compress .pdf files")
+        self.compressed_success = None
+
+    def compress(self, compress_type):
+        f = self.pdfqueue[0].filename
+        if f.endswith(".pdf"):
+            input_file = f
+            output_file = f.replace('.pdf', '.smaller.pdf')
+            compress_type_gs = 'screen'
+            if compress_type == 'Small':
+                compress_type_gs = 'ebook'
+                output_file = f.replace('.pdf', '.small.pdf')
+            gs_args = [
+                'gs',
+                '-dNOPAUSE',
+                '-dBATCH',
+                '-sDEVICE=pdfwrite',
+                '-dCompatibilityLevel=1.4',
+                '-dPDFSETTINGS=/{}'.format(compress_type_gs),
+                '-dQUIET',
+                '-sOutputFile="{}"'.format(output_file),
+                '"{}"'.format(input_file),
+            ]
+            os.system(' '.join(gs_args))
+            self.compressed_success = "Compressed - File is here: {}".format(output_file)
+        GObject.idle_add(self.stop_compress)
+
+    def on_action_compress(self, _action, _param, _unknown):
+        diag = compress.Dialog(self.iconview.get_model(), self.window)
+        compress_ok, compress_type = diag.run_get()
+        if compress_ok:
+            self.init_compress(self.compress, compress_type)
+
 
     @warn_dialog
     def save(self, mode, file_out):
@@ -968,7 +1037,7 @@ class PdfArranger(Gtk.Application):
             res, enabled = exporter.check_content(self.window, self.pdfqueue)
             self.config.set_content_loss_warning(enabled)
             if res == Gtk.ResponseType.CANCEL:
-                return # Abort
+                return  # Abort
         exporter.export(self.pdfqueue, to_export, file_out, mode, m)
 
         if exportmode == 'ALL_TO_SINGLE':
@@ -1292,7 +1361,7 @@ class PdfArranger(Gtk.Application):
     def on_action_select(self, _action, option, _unknown):
         """Selects items according to selected option."""
         selectoptions = {0: 'ALL', 1: 'DESELECT', 2: 'ODD', 3: 'EVEN',
-                         4: 'SAME_FILE', 5: 'SAME_FORMAT', 6:'INVERT'}
+                         4: 'SAME_FILE', 5: 'SAME_FORMAT', 6: 'INVERT'}
         selectoption = selectoptions[option.get_int32()]
         model = self.iconview.get_model()
         if selectoption == 'ALL':
@@ -1655,7 +1724,7 @@ class PdfArranger(Gtk.Application):
                 self.scroll_to_selection()
 
         elif event.keyval in [Gdk.KEY_Up, Gdk.KEY_Down, Gdk.KEY_Left, Gdk.KEY_Right,
-                            Gdk.KEY_Home, Gdk.KEY_End]:
+                              Gdk.KEY_Home, Gdk.KEY_End]:
             # Move cursor, select pages and scroll with navigation keys
             with GObject.signal_handler_block(iconview, self.id_selection_changed_event):
                 self.iv_cursor.handler(iconview, event)
@@ -1988,7 +2057,6 @@ class PdfArranger(Gtk.Application):
         self.model_unlock()
         self.iv_selection_changed_event()
 
-
     @staticmethod
     def reverse_order_available(selection):
         """Determine whether the selection is suitable for the
@@ -2038,8 +2106,8 @@ class PdfArranger(Gtk.Application):
         about_dialog.set_comments(''.join((_(
             '%s is a tool for rearranging and modifying PDF files. '
             'Developed using GTK+ and Python') % APPNAME,
-            '\n \n',
-            _('(%s uses libqpdf %s and pikepdf %s)') % (APPNAME, qpdf, pike))))
+                                           '\n \n',
+                                           _('(%s uses libqpdf %s and pikepdf %s)') % (APPNAME, qpdf, pike))))
         about_dialog.set_authors(['Konstantinos Poulios'])
         about_dialog.add_credit_section(_('Maintainers and contributors'), [
             'https://github.com/pdfarranger/pdfarranger/graphs/contributors'])
@@ -2059,7 +2127,7 @@ class PdfArranger(Gtk.Application):
     def __update_num_pages(self, model, _path=None, _itr=None, _user_data=None):
         num_pages = len(model)
         self.uiXML.get_object("num_pages").set_text(str(num_pages))
-        for a in ["save", "save-as", "select", "export-all"]:
+        for a in ["save", "save-as", "select", "export-all", "compress"]:
             self.window.lookup_action(a).set_enabled(num_pages > 0)
 
     def __update_statusbar(self, num=None):
@@ -2068,11 +2136,11 @@ class PdfArranger(Gtk.Application):
             selected_pages = sorted([p.get_indices()[0] + 1 for p in selection])
             # Compact the representation of the selected page range
             jumps = [[l, r] for l, r in zip(selected_pages, selected_pages[1:])
-                    if l + 1 < r]
+                     if l + 1 < r]
             ranges = list(selected_pages[0:1] + sum(jumps, []) + selected_pages[-1:])
             display = []
             for lo, hi in zip(ranges[::2], ranges[1::2]):
-                range_str = '{}-{}'.format(lo,hi) if lo < hi else '{}'.format(lo)
+                range_str = '{}-{}'.format(lo, hi) if lo < hi else '{}'.format(lo)
                 display.append(range_str)
             ctxt_id = self.status_bar.get_context_id("selected_pages")
             self.status_bar.push(ctxt_id, _('Selected pages: ') + ', '.join(display))
